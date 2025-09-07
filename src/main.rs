@@ -1,4 +1,3 @@
-// TODO: Describe the project
 #![no_std]
 #![no_main]
 
@@ -7,20 +6,27 @@ use defmt_rtt as _;
 use display_interface_spi::SPIInterface;
 use embedded_graphics::{
     Drawable,
-    mono_font::{MonoTextStyle, ascii::FONT_9X18},
+    mono_font::{MonoTextStyle, ascii},
     pixelcolor::{Rgb565, RgbColor},
     prelude::{Point, Primitive, Size},
-    primitives::{PrimitiveStyleBuilder, Rectangle},
+    primitives::{Ellipse, PrimitiveStyleBuilder, Rectangle},
     text::{Text, renderer::CharacterStyle},
 };
 use embedded_hal::digital::{InputPin, OutputPin};
+use embedded_hal::delay::DelayNs;
 use embedded_hal::spi::MODE_0;
 use ili9341::{Ili9341, Orientation};
 use panic_probe as _;
-use rp235x_hal::clocks::init_clocks_and_plls;
-use rp235x_hal::fugit::RateExtU32;
-use rp235x_hal::{self as hal, entry};
-use rp235x_hal::{Clock, gpio::FunctionSpi, pac, spi::Spi};
+use rp235x_hal::{
+    // Clock,
+    clocks::init_clocks_and_plls,
+    fugit::RateExtU32,
+    gpio::FunctionSpi,
+    spi::Spi,
+    {self as hal, entry},
+};
+
+// mod irqs;
 
 // Provide an alias for our BSP so we can switch targets quickly.
 // Uncomment the BSP you included in Cargo.toml, the rest of the code does not need to change.
@@ -34,8 +40,7 @@ pub static IMAGE_DEF: hal::block::ImageDef = hal::block::ImageDef::secure_exe();
 #[entry]
 fn main() -> ! {
     info!("Program start");
-    let mut pac = pac::Peripherals::take().unwrap();
-    let core = cortex_m::Peripherals::take().unwrap();
+    let mut pac = hal::pac::Peripherals::take().unwrap();
     let mut watchdog = hal::Watchdog::new(pac.WATCHDOG);
     let sio = hal::Sio::new(pac.SIO);
 
@@ -53,8 +58,6 @@ fn main() -> ! {
     .ok()
     .unwrap();
 
-    let mut delay = cortex_m::delay::Delay::new(core.SYST, clocks.system_clock.freq().to_Hz());
-
     let pins = hal::gpio::Pins::new(
         pac.IO_BANK0,
         pac.PADS_BANK0,
@@ -62,12 +65,12 @@ fn main() -> ! {
         &mut pac.RESETS,
     );
 
-    let mut encoder_a_pin = pins.gpio2.into_pull_up_input();
-    let mut encoder_b_pin = pins.gpio3.into_pull_up_input();
+    let mut _encoder_a_pin = pins.gpio2.into_pull_up_input();
+    let mut _encoder_b_pin = pins.gpio3.into_pull_up_input();
     let mut encoder_led_pin = pins.gpio4.into_push_pull_output();
-    let mut encoder_switch_pin = pins.gpio5.into_pull_up_input();
+    let mut _encoder_switch_pin = pins.gpio5.into_pull_up_input();
 
-    let mut button1_pin = pins.gpio12.into_pull_up_input();
+    let mut _button1_pin = pins.gpio12.into_pull_up_input();
     let mut button2_pin = pins.gpio13.into_pull_up_input();
 
     let mut backlight_pin = pins.gpio15.into_push_pull_output();
@@ -80,18 +83,21 @@ fn main() -> ! {
     let dc_pin = pins.gpio26.into_push_pull_output();
     let cs_pin = pins.gpio17.into_push_pull_output();
 
-    let spi: rp235x_hal::Spi<_, _, _> = Spi::new(pac.SPI0, spi_pin_layout).init(
+    let spi = Spi::<_, _, _, 8>::new(pac.SPI0, spi_pin_layout).init(
         &mut pac.RESETS,
         125_000_000u32.Hz(),
         16_000_000u32.Hz(),
         MODE_0,
     );
-    let iface = SPIInterface::new(spi, dc_pin, cs_pin);
+    let mut timer = hal::Timer::new_timer0(pac.TIMER0, &mut pac.RESETS, &clocks);
+
+    let excl_spi_dev = embedded_hal_bus::spi::ExclusiveDevice::new(spi, cs_pin, timer).unwrap();
+    let iface = SPIInterface::new(excl_spi_dev, dc_pin);
 
     let mut display = Ili9341::new(
         iface,
         reset_pin,
-        &mut delay,
+        &mut timer,
         Orientation::LandscapeFlipped,
         ili9341::DisplaySize240x320,
     )
@@ -108,29 +114,56 @@ fn main() -> ! {
         .draw(&mut display)
         .unwrap();
 
-    // Create text style
-    let mut text_style = MonoTextStyle::new(&FONT_9X18, Rgb565::WHITE);
+    let mut text_style = MonoTextStyle::new(&ascii::FONT_10X20, Rgb565::GREEN);
 
-    // Position x:5, y: 10
-    Text::new("Verdigris", Point::new(10, 10), text_style)
+    Text::new("Verdigris", Point::new(5, 20), text_style)
         .draw(&mut display)
         .unwrap();
 
-    // Turn text to blue
-    text_style.set_text_color(Some(Rgb565::BLUE));
-    Text::new("World", Point::new(160, 26), text_style)
+    text_style.set_text_color(Some(Rgb565::WHITE));
+    Text::new("Music Player", Point::new(5, 45), text_style)
         .draw(&mut display)
         .unwrap();
+
+    text_style.set_text_color(Some(Rgb565::RED));
+    Text::new("Berlin, 07.2025", Point::new(5, 70), text_style)
+        .draw(&mut display)
+        .unwrap();
+
+    let mut x_pos = 0;
+    let mut y_pos = 120;
+    let dot_size = 10;
+
+    let dot_style = PrimitiveStyleBuilder::new()
+        .fill_color(Rgb565::WHITE)
+        .build();
 
     backlight_pin.set_high().unwrap();
     encoder_led_pin.set_high().unwrap();
     loop {
         info!("loop");
-        delay.delay_ms(500);
+        timer.delay_ms(100);
         if button2_pin.is_high().unwrap() {
             encoder_led_pin.set_high().unwrap();
         } else {
             encoder_led_pin.set_low().unwrap();
+        }
+
+        Ellipse::new(Point::new(x_pos, y_pos), Size::new(dot_size, dot_size))
+            .into_styled(dot_style)
+            .draw(&mut display)
+            .unwrap();
+        x_pos += dot_size as i32;
+        if x_pos >= 320 {
+            x_pos = 0;
+            y_pos += dot_size as i32;
+        }
+        if y_pos >= 240 {
+            y_pos = 120;
+            Rectangle::new(Point::new(0, 120), Size::new(320, 120))
+                .into_styled(bg_style)
+                .draw(&mut display)
+                .unwrap();
         }
     }
 }
