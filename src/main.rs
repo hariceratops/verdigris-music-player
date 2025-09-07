@@ -5,6 +5,14 @@
 use defmt::*;
 use defmt_rtt as _;
 use display_interface_spi::SPIInterface;
+use embedded_graphics::{
+    Drawable,
+    mono_font::{MonoTextStyle, ascii::FONT_9X18},
+    pixelcolor::{Rgb565, RgbColor},
+    prelude::{Point, Primitive, Size},
+    primitives::{PrimitiveStyleBuilder, Rectangle},
+    text::{Text, renderer::CharacterStyle},
+};
 use embedded_hal::digital::OutputPin;
 use embedded_hal::spi::MODE_0;
 use ili9341::{Ili9341, Orientation};
@@ -65,29 +73,55 @@ fn main() -> ! {
     let dc_pin = pins.gpio26.into_push_pull_output();
     let cs_pin = pins.gpio17.into_push_pull_output();
 
-    let spi = Spi::new(pac.SPI0, spi_pin_layout).init(
+    let spi: rp235x_hal::Spi<_, _, _> = Spi::new(pac.SPI0, spi_pin_layout).init(
         &mut pac.RESETS,
         125_000_000u32.Hz(),
         16_000_000u32.Hz(),
         MODE_0,
     );
-    let iface = SPIInterface::new(spi, dc_pin);
+    let iface = SPIInterface::new(spi, dc_pin, cs_pin);
 
     let mut display = Ili9341::new(
         iface,
         reset_pin,
         &mut delay,
-        Orientation::Landscape,
+        Orientation::LandscapeFlipped,
         ili9341::DisplaySize240x320,
     )
     .unwrap();
 
+    let bg_style = PrimitiveStyleBuilder::new()
+        // .stroke_color(Rgb565::RED)
+        // .stroke_width(1)
+        .fill_color(Rgb565::BLACK)
+        .build();
+
+    Rectangle::new(Point::new(0, 0), Size::new(320, 240))
+        .into_styled(bg_style)
+        .draw(&mut display)
+        .unwrap();
+
+    // Create text style
+    let mut text_style = MonoTextStyle::new(&FONT_9X18, Rgb565::WHITE);
+
+    // Position x:5, y: 10
+    Text::new("Verdigris", Point::new(10, 10), text_style)
+        .draw(&mut display)
+        .unwrap();
+
+    // Turn text to blue
+    text_style.set_text_color(Some(Rgb565::BLUE));
+    Text::new("World", Point::new(160, 26), text_style)
+        .draw(&mut display)
+        .unwrap();
+
+    led_pin.set_high().unwrap();
     loop {
         info!("on!");
-        led_pin.set_high().unwrap();
+        // led_pin.set_high().unwrap();
         delay.delay_ms(500);
         info!("off!");
-        led_pin.set_low().unwrap();
+        // led_pin.set_low().unwrap();
         delay.delay_ms(500);
     }
 }
