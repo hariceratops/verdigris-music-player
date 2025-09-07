@@ -1,71 +1,68 @@
-// Alias for our HAL crate
-use rp235x_hal::{
-    gpio,
-    {self as hal},
+use core::{
+    cell::RefCell,
+    sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, Ordering},
 };
-
-
-// Some traits we need
-use embedded_hal::digital::StatefulOutputPin;
-// Some more helpful aliases
-use core::cell::RefCell;
 use critical_section::Mutex;
 
-#[used]
-pub static IMAGE_DEF: hal::block::ImageDef = hal::block::ImageDef::secure_exe();
+use embedded_hal::digital::InputPin;
+use panic_probe as _;
+use rp235x_hal::{self as hal, gpio::Interrupt};
 
-// Pin types quickly become very long!
-// We'll create some type aliases using `type` to help with that
+use crate::board;
 
-/// This pin will be our output - it will drive an LED if you run this on a Pico
-type LedPin = gpio::Pin<gpio::bank0::Gpio4, gpio::FunctionSioOutput, gpio::PullDown>;
+// Pins setup
+static BUTTON1_PIN: Mutex<RefCell<Option<crate::board::Button1Pin>>> =
+    Mutex::new(RefCell::new(None));
+static BUTTON2_PIN: Mutex<RefCell<Option<crate::board::Button2Pin>>> =
+    Mutex::new(RefCell::new(None));
+static ENCODER_A_PIN: Mutex<RefCell<Option<crate::board::EncoderAPin>>> =
+    Mutex::new(RefCell::new(None));
+static ENCODER_B_PIN: Mutex<RefCell<Option<crate::board::EncoderBPin>>> =
+    Mutex::new(RefCell::new(None));
 
-/// This pin will be our interrupt source.
-/// It will trigger an interrupt if pulled to ground (via a switch or jumper wire)
-type ButtonPin = gpio::Pin<gpio::bank0::Gpio12, gpio::FunctionSioInput, gpio::PullUp>;
+// Global States, buttons
+pub static BUTTON1_STATE: AtomicBool = AtomicBool::new(false);
+pub static BUTTON2_STATE: AtomicBool = AtomicBool::new(false);
+// Encoder
+pub static ENCODER_COUNT: AtomicI32 = AtomicI32::new(0);
+static ENCODER_LAST_STATE: AtomicU8 = AtomicU8::new(0);
 
-/// Since we're always accessing these pins together we'll store them in a tuple.
-/// Giving this tuple a type alias means we won't need to use () when putting them
-/// inside an Option. That will be easier to read.
-type LedAndButton = (LedPin, ButtonPin);
+// Debounce
+static BUTTON1_LAST: AtomicU32 = AtomicU32::new(0);
+static BUTTON2_LAST: AtomicU32 = AtomicU32::new(0);
+static ENCODER_LAST: AtomicU32 = AtomicU32::new(0);
+static BUTTON_DEBOUNCE_DELAY_US: u32 = 200_000; // in microseconds
+static ENCODER_DEBOUNCE_DELAY_US: u32 = 15_000; // in microseconds
 
-/// This how we transfer our Led and Button pins into the Interrupt Handler.
-/// We'll have the option hold both using the LedAndButton type.
-/// This will make it a bit easier to unpack them later.
-static GLOBAL_STATE: Mutex<RefCell<Option<LedAndButton>>> = Mutex::new(RefCell::new(None));
+// TODO: Return a meaningful result
+pub fn init() -> Result<(), ()> {
+    board::get_ports(|ports| {
+        // Trigger on the 'falling edge' of the input pin.
+        // This will happen as the button is being pressed
+        let button1_pin = ports.button1_pin.take().unwrap();
+        let button2_pin = ports.button2_pin.take().unwrap();
+        let encoder_a_pin = ports.encoder_a_pin.take().unwrap();
+        let encoder_b_pin = ports.encoder_b_pin.take().unwrap();
 
-pub fn setup(pins: &mut hal::gpio::Pins) {
-    // let mut encoder_a_pin = pins.gpio2.into_pull_up_input();
-    // let mut encoder_b_pin = pins.gpio3.into_pull_up_input();
-    // let mut encoder_led_pin = pins.gpio4.into_push_pull_output();
-    // let mut encoder_switch_pin = pins.gpio5.into_pull_up_input();
-    //
-    // let mut button1_pin = pins.gpio12.into_pull_up_input();
-    // let mut button2_pin = pins.gpio13.into_pull_up_input();
+        button1_pin.set_interrupt_enabled(Interrupt::EdgeLow, true);
+        button2_pin.set_interrupt_enabled(Interrupt::EdgeLow, true);
+        // For encoders, both edges are relevant
+        encoder_a_pin.set_interrupt_enabled(Interrupt::EdgeLow, true);
+        encoder_a_pin.set_interrupt_enabled(Interrupt::EdgeHigh, true);
+        encoder_b_pin.set_interrupt_enabled(Interrupt::EdgeLow, true);
+        encoder_b_pin.set_interrupt_enabled(Interrupt::EdgeHigh, true);
 
-    // Configure GPIO 4 as an output to drive our LED.
-    // we can use reconfigure() instead of into_pull_up_input()
-    // since the variable we're pushing it into has that type
-    // let led = pins.gpio25.reconfigure();
-    // let encoder_led_pin = pins.gpio4.into_push_pull_output();
-    let encoder_led_pin = pins.gpio4.reconfigure();
-
-    // Set up the GPIO pin that will be our input
-    // let in_pin = pins.gpio26.reconfigure();
-    // let button1_pin = pins.gpio12.into_pull_up_input();
-    let button1_pin = pins.gpio12.reconfigure();
-
-    // Trigger on the 'falling edge' of the input pin.
-    // This will happen as the button is being pressed
-    button1_pin.set_interrupt_enabled(gpio::Interrupt::EdgeLow, true);
-
-    // Give away our pins by moving them into the `GLOBAL_PINS` variable.
-    // We won't need to access them in the main thread again
-    critical_section::with(|cs| {
-        GLOBAL_STATE
-            .borrow(cs)
-            .replace(Some((encoder_led_pin, button1_pin)));
+        // // Export to global mutexes
+        critical_section::with(|cs| {
+            BUTTON1_PIN.borrow(cs).replace(Some(button1_pin));
+            BUTTON2_PIN.borrow(cs).replace(Some(button2_pin));
+            ENCODER_A_PIN.borrow(cs).replace(Some(encoder_a_pin));
+            ENCODER_B_PIN.borrow(cs).replace(Some(encoder_b_pin));
+        });
     });
+
+    // Initialize encoder state
+    ENCODER_LAST_STATE.store(0, Ordering::Relaxed);
 
     // Unmask the IRQ for I/O Bank 0 so that the RP2350's interrupt controller
     // (NVIC in Arm mode, or Xh3irq in RISC-V mode) will jump to the interrupt
@@ -82,10 +79,15 @@ pub fn setup(pins: &mut hal::gpio::Pins) {
     unsafe {
         hal::arch::interrupt_enable();
     }
+
+    Ok(())
 }
 
-pub fn worker() {
-    hal::arch::wfi();
+#[inline(always)]
+fn now_us() -> u32 {
+    // Safe because we're only *reading* from a monotonic counter
+    let timer = unsafe { &*hal::pac::TIMER0::ptr() };
+    timer.timerawl().read().bits() // lower 32 bits of the free-running timer
 }
 
 /// This is the interrupt handler that fires when GPIO Bank 0 detects an event
@@ -101,24 +103,87 @@ fn IO_IRQ_BANK0() {
     // executed on the other core. This also protects us if the main thread
     // decides to execute this function (which it shouldn't, but we can't stop
     // them if they wanted to).
+
     critical_section::with(|cs| {
-        // Grab a mutable reference to the global state, using the CS token as
-        // proof we have turned off interrupts. Performs a run-time borrow check
-        // of the RefCell to ensure no-one else is currently borrowing it (and
-        // they shouldn't, because we're in a critical section right now).
-        let mut maybe_state = GLOBAL_STATE.borrow_ref_mut(cs);
-        // Need to check if our Option<LedAndButtonPins> contains our pins
-        if let Some((led, button)) = maybe_state.as_mut() {
-            // Check if the interrupt source is from the pushbutton going from high-to-low.
-            // Note: this will always be true in this example, as that is the only enabled GPIO interrupt source
-            if button.interrupt_status(gpio::Interrupt::EdgeLow) {
-                // toggle can't fail, but the embedded-hal traits always allow for it
-                // we can discard the return value by assigning it to an unnamed variable
-                let _ = led.toggle();
-                // Our interrupt doesn't clear itself.
-                // Do that now so we don't immediately jump back to this interrupt handler.
-                button.clear_interrupt(gpio::Interrupt::EdgeLow);
+        let now_us = now_us();
+
+        // FIXME: not DRY
+        // BUTTON1
+        if let Some(ref mut btn1) = BUTTON1_PIN.borrow(cs).borrow_mut().as_mut() {
+            if btn1.interrupt_status(Interrupt::EdgeLow) {
+                let last = BUTTON1_LAST.load(Ordering::Relaxed);
+                if now_us.wrapping_sub(last) > BUTTON_DEBOUNCE_DELAY_US {
+                    let cur = BUTTON1_STATE.load(Ordering::Relaxed);
+                    BUTTON1_STATE.store(!cur, Ordering::Relaxed);
+                    BUTTON1_LAST.store(now_us, Ordering::Relaxed);
+                }
+                btn1.clear_interrupt(Interrupt::EdgeLow);
             }
+        }
+
+        // BUTTON2
+        if let Some(ref mut btn2) = BUTTON2_PIN.borrow(cs).borrow_mut().as_mut() {
+            if btn2.interrupt_status(Interrupt::EdgeLow) {
+                let last = BUTTON2_LAST.load(Ordering::Relaxed);
+                if now_us.wrapping_sub(last) > BUTTON_DEBOUNCE_DELAY_US {
+                    let cur = BUTTON2_STATE.load(Ordering::Relaxed);
+                    BUTTON2_STATE.store(!cur, Ordering::Relaxed);
+                    BUTTON2_LAST.store(now_us, Ordering::Relaxed);
+                }
+                btn2.clear_interrupt(Interrupt::EdgeLow);
+            }
+        }
+
+        // ENCODER
+        // FIXME: Not Dry
+        let mut new_state = 0u8;
+
+        // FIXME: There is much better ways to debounce the encoder, either in software or with a schmitt-trigger.
+        // Using an IC will increase the BoM, but should be more reliable, and spares interrupts and CPU cycles.
+        let last = ENCODER_LAST.load(Ordering::Relaxed);
+        if now_us.wrapping_sub(last) > ENCODER_DEBOUNCE_DELAY_US {
+            if let Some(ref mut enc_a) = ENCODER_A_PIN.borrow(cs).borrow_mut().as_mut() {
+                if enc_a.interrupt_status(Interrupt::EdgeLow)
+                    || enc_a.interrupt_status(Interrupt::EdgeHigh)
+                {
+                    enc_a.clear_interrupt(Interrupt::EdgeLow);
+                    enc_a.clear_interrupt(Interrupt::EdgeHigh);
+                }
+                if enc_a.is_high().unwrap_or(false) {
+                    new_state |= 0b10;
+                }
+            }
+
+            if let Some(ref mut enc_b) = ENCODER_B_PIN.borrow(cs).borrow_mut().as_mut() {
+                if enc_b.interrupt_status(Interrupt::EdgeLow)
+                    || enc_b.interrupt_status(Interrupt::EdgeHigh)
+                {
+                    enc_b.clear_interrupt(Interrupt::EdgeLow);
+                    enc_b.clear_interrupt(Interrupt::EdgeHigh);
+                }
+                if enc_b.is_high().unwrap_or(false) {
+                    new_state |= 0b01;
+                }
+            }
+
+            let last = ENCODER_LAST_STATE.load(Ordering::Relaxed);
+
+            // Quadrature decoding table
+            // (last_state << 2 | new_state) → delta
+            const LOOKUP: [i32; 16] = [
+                0, -1, 1, 0, // 00
+                1, 0, 0, -1, // 01
+                -1, 0, 0, 1, // 10
+                0, 1, -1, 0, // 11
+            ];
+
+            let idx = (last << 2 | new_state) as usize;
+            let delta = LOOKUP[idx];
+            if delta != 0 {
+                ENCODER_COUNT.fetch_add(delta, Ordering::Relaxed);
+                ENCODER_LAST_STATE.store(new_state, Ordering::Relaxed);
+            }
+            ENCODER_LAST.store(now_us, Ordering::Relaxed);
         }
     });
 }
