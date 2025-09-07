@@ -13,7 +13,7 @@ use embedded_graphics::{
     primitives::{PrimitiveStyleBuilder, Rectangle},
     text::{Text, renderer::CharacterStyle},
 };
-use embedded_hal::digital::OutputPin;
+use embedded_hal::digital::{InputPin, OutputPin};
 use embedded_hal::spi::MODE_0;
 use ili9341::{Ili9341, Orientation};
 use panic_probe as _;
@@ -62,8 +62,15 @@ fn main() -> ! {
         &mut pac.RESETS,
     );
 
-    let mut led_pin = pins.gpio2.into_push_pull_output();
+    let mut encoder_a_pin = pins.gpio2.into_pull_up_input();
+    let mut encoder_b_pin = pins.gpio3.into_pull_up_input();
+    let mut encoder_led_pin = pins.gpio4.into_push_pull_output();
+    let mut encoder_switch_pin = pins.gpio5.into_pull_up_input();
 
+    let mut button1_pin = pins.gpio12.into_pull_up_input();
+    let mut button2_pin = pins.gpio13.into_pull_up_input();
+
+    let mut backlight_pin = pins.gpio15.into_push_pull_output();
     let mosi = pins.gpio19.into_function::<FunctionSpi>();
     let miso = pins.gpio16.into_function::<FunctionSpi>();
     let sclk = pins.gpio18.into_function::<FunctionSpi>();
@@ -115,14 +122,16 @@ fn main() -> ! {
         .draw(&mut display)
         .unwrap();
 
-    led_pin.set_high().unwrap();
+    backlight_pin.set_high().unwrap();
+    encoder_led_pin.set_high().unwrap();
     loop {
-        info!("on!");
-        // led_pin.set_high().unwrap();
+        info!("loop");
         delay.delay_ms(500);
-        info!("off!");
-        // led_pin.set_low().unwrap();
-        delay.delay_ms(500);
+        if button2_pin.is_high().unwrap() {
+            encoder_led_pin.set_high().unwrap();
+        } else {
+            encoder_led_pin.set_low().unwrap();
+        }
     }
 }
 
