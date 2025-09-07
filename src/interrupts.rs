@@ -8,7 +8,7 @@ use embedded_hal::digital::InputPin;
 use panic_probe as _;
 use rp235x_hal::{self as hal, gpio::Interrupt};
 
-use crate::board;
+use crate::board::{Button1Pin, Button2Pin, EncoderAPin, EncoderBPin};
 
 // Pins setup
 static BUTTON1_PIN: Mutex<RefCell<Option<crate::board::Button1Pin>>> =
@@ -35,30 +35,28 @@ static BUTTON_DEBOUNCE_DELAY_US: u32 = 200_000; // in microseconds
 static ENCODER_DEBOUNCE_DELAY_US: u32 = 15_000; // in microseconds
 
 // TODO: Return a meaningful result
-pub fn init() -> Result<(), ()> {
-    board::get_ports(|ports| {
-        // Trigger on the 'falling edge' of the input pin.
-        // This will happen as the button is being pressed
-        let button1_pin = ports.button1_pin.take().unwrap();
-        let button2_pin = ports.button2_pin.take().unwrap();
-        let encoder_a_pin = ports.encoder_a_pin.take().unwrap();
-        let encoder_b_pin = ports.encoder_b_pin.take().unwrap();
+pub fn init(
+    button1_pin: Button1Pin,
+    button2_pin: Button2Pin,
+    encoder_a_pin: EncoderAPin,
+    encoder_b_pin: EncoderBPin,
+) -> Result<(), ()> {
+    // Trigger on the 'falling edge' of the input pin.
+    // This will happen as the button is being pressed
+    button1_pin.set_interrupt_enabled(Interrupt::EdgeLow, true);
+    button2_pin.set_interrupt_enabled(Interrupt::EdgeLow, true);
+    // For encoders, both edges are relevant
+    encoder_a_pin.set_interrupt_enabled(Interrupt::EdgeLow, true);
+    encoder_a_pin.set_interrupt_enabled(Interrupt::EdgeHigh, true);
+    encoder_b_pin.set_interrupt_enabled(Interrupt::EdgeLow, true);
+    encoder_b_pin.set_interrupt_enabled(Interrupt::EdgeHigh, true);
 
-        button1_pin.set_interrupt_enabled(Interrupt::EdgeLow, true);
-        button2_pin.set_interrupt_enabled(Interrupt::EdgeLow, true);
-        // For encoders, both edges are relevant
-        encoder_a_pin.set_interrupt_enabled(Interrupt::EdgeLow, true);
-        encoder_a_pin.set_interrupt_enabled(Interrupt::EdgeHigh, true);
-        encoder_b_pin.set_interrupt_enabled(Interrupt::EdgeLow, true);
-        encoder_b_pin.set_interrupt_enabled(Interrupt::EdgeHigh, true);
-
-        // // Export to global mutexes
-        critical_section::with(|cs| {
-            BUTTON1_PIN.borrow(cs).replace(Some(button1_pin));
-            BUTTON2_PIN.borrow(cs).replace(Some(button2_pin));
-            ENCODER_A_PIN.borrow(cs).replace(Some(encoder_a_pin));
-            ENCODER_B_PIN.borrow(cs).replace(Some(encoder_b_pin));
-        });
+    // // Export to global mutexes
+    critical_section::with(|cs| {
+        BUTTON1_PIN.borrow(cs).replace(Some(button1_pin));
+        BUTTON2_PIN.borrow(cs).replace(Some(button2_pin));
+        ENCODER_A_PIN.borrow(cs).replace(Some(encoder_a_pin));
+        ENCODER_B_PIN.borrow(cs).replace(Some(encoder_b_pin));
     });
 
     // Initialize encoder state
@@ -92,10 +90,6 @@ fn now_us() -> u32 {
 
 /// This is the interrupt handler that fires when GPIO Bank 0 detects an event
 /// (like an edge).
-///
-/// We give it an unmangled name so that it replaces the default (empty)
-/// handler. These handlers are referred to by name from the Interrupt Vector
-/// Table created by cortex-m-rt.
 #[allow(non_snake_case)]
 #[unsafe(no_mangle)]
 fn IO_IRQ_BANK0() {

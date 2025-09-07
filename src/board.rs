@@ -1,21 +1,13 @@
-use core::cell::RefCell;
-use cortex_m::interrupt::CriticalSection;
-use critical_section::Mutex;
-
+use alloc::rc::Rc;
 use display_interface_spi::SPIInterface;
-use embedded_graphics::{
-    Drawable,
-    mono_font::{MonoTextStyle, ascii},
-    pixelcolor::{Rgb565, RgbColor},
-    prelude::*,
-    prelude::{Point, Primitive, Size},
-    primitives::{Arc, Ellipse, PrimitiveStyle, PrimitiveStyleBuilder, Rectangle},
-    text::{Text, renderer::CharacterStyle},
-};
 use embedded_hal::spi::MODE_0;
 use embedded_hal_bus::{spi::AtomicDevice, util::AtomicCell};
 use ili9341::{Ili9341, Orientation};
-use ina219::{calibration::{Calibration, UnCalibrated}, SyncIna219};
+use ina219::{
+    SyncIna219,
+    address::Address,
+    calibration::{UnCalibrated},
+};
 use panic_probe as _;
 use rp235x_hal::{
     // Clock,
@@ -35,15 +27,17 @@ use rp235x_hal::{
     timer::CopyableTimer0,
 };
 
+use crate::rtc::{RtcTimeSource, SharedRtcTimeSource};
+
 // External high-speed crystal on the pico board is 12Mhz
 const XTAL_FREQ_HZ: u32 = 12_000_000u32;
 
 #[derive(Debug)]
 pub enum Error {
-    InitializationError,
+    // InitializationError,
     DisplayInitError,
-    RtcInitError,
-    BatteryInitError
+    // RtcInitError,
+    BatteryInitError,
 }
 
 pub type Button1Pin = Pin<Gpio12, FunctionSioInput, PullUp>;
@@ -72,18 +66,23 @@ type DisplayCsPin = Pin<Gpio17, FunctionSioOutput, PullDown>;
 pub type DisplayBacklightPin = Pin<Gpio15, FunctionSioOutput, PullDown>;
 type SdCsPin = Pin<Gpio8, FunctionSioOutput, PullDown>;
 
-type SpiBusTypeAlias = Spi<Enabled, SPI0, SpiPins>;
-type DisplayTypeAlias = Ili9341<
+type RtcI2C = hal::I2C<I2C0, RtcI2cPins>;
+type BatteryI2C = hal::I2C<I2C1, BatteryI2cPins>;
+pub type SpiBusTypeAlias = Spi<Enabled, SPI0, SpiPins>;
+type DisplayTypeAlias<'a> = Ili9341<
     SPIInterface<
-        AtomicDevice<'static, SpiBusTypeAlias, DisplayCsPin, Timer<CopyableTimer0>>,
+        AtomicDevice<'a, SpiBusTypeAlias, DisplayCsPin, Timer<CopyableTimer0>>,
         SpiDcPin,
     >,
     SpiResetPin,
 >;
 
-pub static PORTS: Mutex<RefCell<Option<Ports>>> = Mutex::new(RefCell::new(None));
+pub(crate) struct Display<'a> {
+    pub(crate) ili: DisplayTypeAlias<'a>,
+    pub(crate) backlight_pin: DisplayBacklightPin,
+}
 
-pub struct Ports {
+pub struct Board {
     pub(crate) display_backlight_pin: Option<DisplayBacklightPin>,
     pub(crate) button1_pin: Option<Button1Pin>,
     pub(crate) button2_pin: Option<Button2Pin>,
@@ -93,14 +92,14 @@ pub struct Ports {
     pub(crate) reset_pin: Option<SpiResetPin>,
     pub(crate) display_cs_pin: Option<DisplayCsPin>,
     pub(crate) timer: Option<Timer<CopyableTimer0>>,
-    pub(crate) rtc_i2c: Option<hal::I2C<I2C0, RtcI2cPins>>,
-    pub(crate) battery_i2c: Option<hal::I2C<I2C1, BatteryI2cPins>>,
+    pub(crate) rtc_i2c: Option<RtcI2C>,
+    pub(crate) battery_i2c: Option<BatteryI2C>,
     pub(crate) sd_cs_pin: Option<SdCsPin>,
     pub(crate) spi_bus: Option<AtomicCell<SpiBusTypeAlias>>,
     // display: DisplayTypeAlias
 }
 
-impl Ports {
+impl Board {
     fn new(
         display_backlight_pin: DisplayBacklightPin,
         button1_pin: Button1Pin,
@@ -111,8 +110,8 @@ impl Ports {
         reset_pin: SpiResetPin,
         display_cs_pin: DisplayCsPin,
         timer: Timer<CopyableTimer0>,
-        rtc_i2c: hal::I2C<I2C0, RtcI2cPins>,
-        battery_i2c: hal::I2C<I2C1, BatteryI2cPins>,
+        rtc_i2c: RtcI2C,
+        battery_i2c: BatteryI2C,
         sd_cs_pin: SdCsPin,
         spi_bus: AtomicCell<SpiBusTypeAlias>,
     ) -> Self {
@@ -133,7 +132,7 @@ impl Ports {
         }
     }
 
-    pub fn init() -> Result<(), Error> {
+    pub fn init() -> Result<Board, Error> {
         // Share pac, sio and pins in a struct crate-wide
 
         // Initialize HAL GPIOs and Timers
@@ -244,100 +243,124 @@ impl Ports {
             spi_bus,
         );
 
-        // Export busses
-        critical_section::with(move |cs| {
-            PORTS.borrow(cs).borrow_mut().replace(ports);
-        });
-
-        Ok(())
+        // TODO: Return an error, eventually
+        Ok(ports)
     }
 
-    // pub fn init_display(
-    //     spi_bus_ref: &AtomicCell<SpiBusTypeAlias>,
-    // ) -> Result<(DisplayTypeAlias, DisplayBacklightPin), Error> {
-    //     let (dc_pin, reset_pin, display_cs_pin, display_backlight_pin, mut timer) =
-    //         get_ports(|ports| {
-    //             (
-    //                 ports.dc_pin.take().unwrap(),
-    //                 ports.reset_pin.take().unwrap(),
-    //                 ports.display_cs_pin.take().unwrap(),
-    //                 ports.display_backlight_pin.take().unwrap(),
-    //                 ports.timer.take().unwrap(),
-    //             )
-    //         })
-    //         .unwrap();
-    //     let exclusive_display_spi_dev =
-    //         AtomicDevice::new(spi_bus_ref, display_cs_pin, timer).unwrap();
-    //
-    //     let display_iface = SPIInterface::new(exclusive_display_spi_dev, dc_pin);
-    //     if let Ok(ili) = Ili9341::new(
-    //         display_iface,
-    //         reset_pin,
-    //         &mut timer,
-    //         Orientation::LandscapeFlipped,
-    //         ili9341::DisplaySize240x320,
-    //     ) {
-    //         // TODO: Borrowed value timer doesn't outlive display
-    //         Ok((ili, display_backlight_pin))
-    //     } else {
-    //         Err(Error::DisplayInitError)
-    //     }
-    // }
+    pub fn take_display_backlight_pin(&mut self) -> DisplayBacklightPin {
+        self.display_backlight_pin
+            .take()
+            .expect("Battery I2C can only be taken once!")
+    }
+    pub fn take_button1_pin(&mut self) -> Button1Pin {
+        self.button1_pin
+            .take()
+            .expect("Battery I2C can only be taken once!")
+    }
+    pub fn take_button2_pin(&mut self) -> Button2Pin {
+        self.button2_pin
+            .take()
+            .expect("Battery I2C can only be taken once!")
+    }
+    pub fn take_encoder_a_pin(&mut self) -> EncoderAPin {
+        self.encoder_a_pin
+            .take()
+            .expect("Battery I2C can only be taken once!")
+    }
+    pub fn take_encoder_b_pin(&mut self) -> EncoderBPin {
+        self.encoder_b_pin
+            .take()
+            .expect("Battery I2C can only be taken once!")
+    }
+    pub fn take_dc_pin(&mut self) -> SpiDcPin {
+        self.dc_pin
+            .take()
+            .expect("Battery I2C can only be taken once!")
+    }
+    pub fn take_reset_pin(&mut self) -> SpiResetPin {
+        self.reset_pin
+            .take()
+            .expect("Battery I2C can only be taken once!")
+    }
+    pub fn take_display_cs_pin(&mut self) -> DisplayCsPin {
+        self.display_cs_pin
+            .take()
+            .expect("Battery I2C can only be taken once!")
+    }
+    pub fn take_timer(&mut self) -> Timer<CopyableTimer0> {
+        self.timer
+            .take()
+            .expect("Battery I2C can only be taken once!")
+    }
+    pub fn take_rtc_i2c(&mut self) -> RtcI2C {
+        self.rtc_i2c
+            .take()
+            .expect("Battery I2C can only be taken once!")
+    }
+    pub fn take_battery_i2c(&mut self) -> BatteryI2C {
+        self.battery_i2c
+            .take()
+            .expect("Battery I2C can only be taken once!")
+    }
+    pub fn take_sd_cs_pin(&mut self) -> SdCsPin {
+        self.sd_cs_pin
+            .take()
+            .expect("Battery I2C can only be taken once!")
+    }
+    pub fn take_spi_bus(&mut self) -> AtomicCell<SpiBusTypeAlias> {
+        self.spi_bus
+            .take()
+            .expect("Battery I2C can only be taken once!")
+    }
 
-    // pub fn init_battery() -> Result<SyncIna219<hal::I2C<I2C0, RtcI2cPins>, UnCalibrated>, Error> {
-    //     let mut ina219 = SyncIna219::new(battery_i2c, Address::from_byte(0x43).unwrap());
-    //     if let Ok(ref mut ina_dev) = ina219 {
-    //         ina_dev
-    //             .configuration()
-    //             .unwrap()
-    //             .conversion_time_us()
-    //             .unwrap();
-    //         Ok(ina_dev)
-    //     } else {
-    //         Err(Error::BatteryInitError)
-    //     }
-    // }
-}
+    pub fn init_display<'a>(
+        &mut self,
+        spi_bus: &'a AtomicCell<SpiBusTypeAlias>,
+        timer: &'a mut Timer<CopyableTimer0>,
+    ) -> Result<Display<'a>, Error> {
+        let dc_pin = self.take_dc_pin();
+        let reset_pin = self.take_reset_pin();
+        let display_cs_pin = self.take_display_cs_pin();
+        let display_backlight_pin = self.take_display_backlight_pin();
 
-pub fn get_ports<F, R>(f: F) -> Option<R>
-where
-    F: FnOnce(&mut Ports) -> R,
-{
-    critical_section::with(|cs| {
-        if let Some(ports) = PORTS.borrow(cs).borrow_mut().as_mut() {
-            Some(f(ports))
+        let exclusive_display_spi_dev =
+            AtomicDevice::new(spi_bus, display_cs_pin, timer.clone()).unwrap();
+
+        let display_iface = SPIInterface::new(exclusive_display_spi_dev, dc_pin);
+        if let Ok(ili) = Ili9341::new(
+            display_iface,
+            reset_pin,
+            timer,
+            Orientation::LandscapeFlipped,
+            ili9341::DisplaySize240x320,
+        ) {
+            // STORY: Borrowed value timer didn't outlive display
+            Ok(Display {
+                ili,
+                backlight_pin: display_backlight_pin
+            })
         } else {
-            None
+            Err(Error::DisplayInitError)
         }
-    })
-}
+    }
 
-// let (
-//     spi_bus,
-//     dc_pin,
-//     reset_pin,
-//     display_cs_pin,
-//     mut display_backlight_pin,
-//     sd_cs_pin,
-//     rtc_timesource,
-//     battery_i2c,
-//     mut timer,
-// ) = board::get_ports(|ports| {
-//     (
-//         // Display
-//         ports.spi_bus.take().unwrap(),
-//         ports.dc_pin.take().unwrap(),
-//         ports.reset_pin.take().unwrap(),
-//         ports.display_cs_pin.take().unwrap(),
-//         ports.display_backlight_pin.take().unwrap(),
-//         // SD-Card
-//         ports.sd_cs_pin.take().unwrap(),
-//         // RTC device
-//         SharedRtcTimeSource(Rc::new(RtcTimeSource::new(ports.rtc_i2c.take().unwrap()))),
-//         // Battery device
-//         ports.battery_i2c.take().unwrap(),
-//         // Common
-//         ports.timer.take().unwrap(),
-//     )
-// })
-// .unwrap();
+    pub fn init_battery(&mut self) -> Result<SyncIna219<BatteryI2C, UnCalibrated>, Error> {
+        let battery_i2c = self.take_battery_i2c();
+        let ina219 = SyncIna219::new(battery_i2c, Address::from_byte(0x43).unwrap());
+        if let Ok(mut ina_dev) = ina219 {
+            ina_dev
+                .configuration()
+                .unwrap()
+                .conversion_time_us()
+                .unwrap();
+            Ok(ina_dev)
+        } else {
+            Err(Error::BatteryInitError)
+        }
+    }
+    pub fn init_rtc_timesource(&mut self) -> Option<SharedRtcTimeSource<RtcI2C>> {
+        let rtc_i2c = self.take_rtc_i2c();
+        let shared_rtc = SharedRtcTimeSource(Rc::new(RtcTimeSource::new(rtc_i2c)));
+        Some(shared_rtc)
+    }
+}

@@ -16,39 +16,20 @@ use defmt::*;
 use defmt_rtt as _;
 
 // Core functionalities
-use alloc::{rc::Rc, string::String};
-use core::{
-    cell::RefCell,
-    fmt::Write,
-    sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, Ordering},
-};
-use critical_section::Mutex;
-use embedded_hal_bus::spi::AtomicDevice;
+use alloc::string::String;
+use core::{fmt::Write, sync::atomic::Ordering};
+use embedded_hal_bus::{spi::AtomicDevice};
 
-use embedded_hal::{
-    delay::DelayNs,
-    digital::{InputPin, OutputPin},
-    spi::{SpiBus, MODE_0},
-};
+use embedded_hal::digital::OutputPin;
 use embedded_sdmmc::{DirEntry, SdCard, VolumeIdx, VolumeManager};
-use ili9341::{Ili9341, Orientation};
 use panic_probe as _;
 use rp235x_hal::{
     // Clock,
-    clocks::init_clocks_and_plls,
-    fugit::RateExtU32,
-    gpio::{self, FunctionI2C, FunctionSpi, Pin},
-    i2c::I2C,
-    spi::Spi,
     {self as hal, entry},
 };
 
-// Peripherals
-use display_interface_spi::SPIInterface;
-use ina219::SyncIna219;
-use ina219::address::Address;
-
 // UI
+// TODO: Move the Display logic in its own file
 use embedded_graphics::{
     Drawable,
     mono_font::{MonoTextStyle, ascii},
@@ -60,21 +41,15 @@ use embedded_graphics::{
 };
 
 mod rtc;
-use rtc::{RtcTimeSource, SharedRtcTimeSource};
-
 mod interrupts;
-use interrupts::{BUTTON1_STATE, BUTTON2_STATE, ENCODER_COUNT};
-
 mod board;
-use board::Ports;
+
+use interrupts::{BUTTON1_STATE, BUTTON2_STATE, ENCODER_COUNT};
+use board::Board;
 
 // Battery
 const MAX_BUS_VOLTAGE: u16 = 4200;
 const MIN_BUS_VOLTAGE: u16 = 3800;
-
-// Provide an alias for our BSP so we can switch targets quickly.
-// Uncomment the BSP you included in Cargo.toml, the rest of the code does not need to change.
-// use some_bsp;
 
 /// Tell the Boot ROM about our application
 #[unsafe(link_section = ".start_block")]
@@ -85,88 +60,78 @@ pub static IMAGE_DEF: hal::block::ImageDef = hal::block::ImageDef::secure_exe();
 #[allow(static_mut_refs)]
 #[entry]
 fn main() -> ! {
-    info!("Program start");
+    info!("Verdigris Music Player start");
+
+    //
+    // Initialize hardware
+    //
 
     // Initialize the allocator. Ensure this happen only once.
     unsafe {
         HEAP.init(HEAP_MEM.as_ptr() as usize, HEAP_SIZE);
     }
 
-    // Board::init();
-    // BoardAccessor::get()
-    // BoardAccessor::get_display()
-    Ports::init().expect("Failed to setup boards");
+    // Get access to all hardware components
+    let mut board = Board::init().expect("Failed to setup boards");
 
-    if let Ok(()) = interrupts::init() {
-        info!("Interrupts setup successful");
-    } else {
-        crate::panic!("Failed to setup interrupts");
-    }
-
-    let (
-        spi_bus,
-        dc_pin,
-        reset_pin,
-        display_cs_pin,
-        mut display_backlight_pin,
-        sd_cs_pin,
-        rtc_timesource,
-        battery_i2c,
-        mut timer,
-    ) = board::get_ports(|ports| {
-        (
-            // Display
-            ports.spi_bus.take().unwrap(),
-            ports.dc_pin.take().unwrap(),
-            ports.reset_pin.take().unwrap(),
-            ports.display_cs_pin.take().unwrap(),
-            ports.display_backlight_pin.take().unwrap(),
-            // SD-Card
-            ports.sd_cs_pin.take().unwrap(),
-            // RTC device
-            SharedRtcTimeSource(Rc::new(RtcTimeSource::new(ports.rtc_i2c.take().unwrap()))),
-            // Battery device
-            ports.battery_i2c.take().unwrap(),
-            // Common
-            ports.timer.take().unwrap(),
-        )
-    })
-    .unwrap();
-
-    // let (mut display, mut display_backlight_pin) = Ports::init_display(&spi_bus).unwrap();
-    let exclusive_display_spi_dev = AtomicDevice::new(&spi_bus, display_cs_pin, timer).unwrap();
-
-    let display_iface = SPIInterface::new(exclusive_display_spi_dev, dc_pin);
-    let mut display = Ili9341::new(
-        display_iface,
-        reset_pin,
-        &mut timer,
-        Orientation::LandscapeFlipped,
-        ili9341::DisplaySize240x320,
+    // TODO: refactor interrupts to expose a struct instead. See if this gymnastic make sense.
+    interrupts::init(
+        board.take_button1_pin(),
+        board.take_button2_pin(),
+        board.take_encoder_a_pin(),
+        board.take_encoder_b_pin(),
     )
-    .unwrap();
+    .expect("Failed to setup interrupts!");
 
-    // Battery device
-    let mut ina = None;
-    let mut ina219 = SyncIna219::new(battery_i2c, Address::from_byte(0x43).unwrap());
-    if let Ok(ref mut ina_dev) = ina219 {
-        ina_dev
-            .configuration()
-            .unwrap()
-            .conversion_time_us()
-            .unwrap();
-        ina = Some(ina_dev)
-    } else {
-        info!("Failed to setup the battery chip management.")
-    }
+    // Common object that must live and be owned in this scope
+    let spi_bus = board.take_spi_bus();
+    let mut timer = board.take_timer();
 
     // RTC
+    let rtc_timesource = board.init_rtc_timesource().unwrap();
+    // TODO: Provide an elegant way to set/adjust the time
     // Set time manually:
     // let begin = NaiveDate::from_ymd_opt(2025, 8, 21)
     //     .unwrap()
     //     .and_hms_opt(15, 20, 10)
     //     .unwrap();
     // rtc.set_datetime(&begin).unwrap();
+
+    // SD-Card
+    // TODO: List files in a UI, play them. Write a full spec.
+    let sd_cs_pin = board.take_sd_cs_pin();
+    let exclusive_sd_spi_dev = AtomicDevice::new(&spi_bus, sd_cs_pin, timer).unwrap();
+    let sdcard = SdCard::new(exclusive_sd_spi_dev, timer.clone());
+    info!("Card size is {} bytes", sdcard.num_bytes().unwrap());
+    let volume_mgr = VolumeManager::new(sdcard, rtc_timesource.clone());
+
+    let raw_volume0 = volume_mgr.open_raw_volume(VolumeIdx(0)).unwrap();
+
+    let root_dir = volume_mgr.open_root_dir(raw_volume0).unwrap();
+    let print = |item: &DirEntry| {
+        let filename = core::str::from_utf8(item.name.base_name()).unwrap();
+        info!("{:?} {:?} Mb", filename, item.size as f32 / 1024.0 / 1024.0)
+    };
+    volume_mgr.iterate_dir(root_dir, print).unwrap();
+
+    // Display
+    let board::Display {
+        ili: mut display,
+        backlight_pin: mut display_backlight_pin,
+    } = board.init_display(&spi_bus, &mut timer).unwrap();
+
+    // Battery and charge information
+    // TODO: Calibrate
+    let mut ina = board.init_battery();
+
+    // Get the real time
+    let shared_rtc = rtc_timesource.0;
+
+    //
+    // Main logic
+    //
+
+    let mut previous_datetime = shared_rtc.get_datetime().unwrap().and_utc();
 
     let bg_style = PrimitiveStyleBuilder::new()
         .fill_color(Rgb565::BLACK)
@@ -175,12 +140,6 @@ fn main() -> ! {
     let battery_bar_style = PrimitiveStyleBuilder::new()
         .fill_color(Rgb565::CSS_AQUA)
         .build();
-
-    // let debug_style = PrimitiveStyleBuilder::new()
-    //     .stroke_color(Rgb565::CSS_PINK)
-    //     .stroke_width(1)
-    //     .fill_color(Rgb565::CSS_GRAY)
-    //     .build();
 
     Rectangle::new(Point::new(0, 0), Size::new(320, 240))
         .into_styled(bg_style)
@@ -199,24 +158,6 @@ fn main() -> ! {
 
     // Turn on the display
     display_backlight_pin.set_high().unwrap();
-
-    // SD-Card
-    let exclusive_sd_spi_dev = AtomicDevice::new(&spi_bus, sd_cs_pin, timer).unwrap();
-    let sdcard = SdCard::new(exclusive_sd_spi_dev, timer.clone());
-    info!("Card size is {} bytes", sdcard.num_bytes().unwrap());
-    let volume_mgr = VolumeManager::new(sdcard, rtc_timesource.clone());
-
-    let raw_volume0 = volume_mgr.open_raw_volume(VolumeIdx(0)).unwrap();
-
-    let root_dir = volume_mgr.open_root_dir(raw_volume0).unwrap();
-    let print = |item: &DirEntry| {
-        let filename = core::str::from_utf8(item.name.base_name()).unwrap();
-        info!("{:?} {:?} Mb", filename, item.size as f32 / 1024.0 / 1024.0)
-    };
-    volume_mgr.iterate_dir(root_dir, print).unwrap();
-
-    let shared_rtc = rtc_timesource.0;
-    let mut previous_datetime = shared_rtc.get_datetime().unwrap().and_utc();
 
     let row_height = 20; // pixels
     let datetime_row = 2 * row_height;
@@ -253,7 +194,7 @@ fn main() -> ! {
         }
 
         // Get and display the battery status
-        if let Some(ref mut ina_dev) = ina {
+        if let Ok(ref mut ina_dev) = ina {
             Rectangle::new(
                 Point::new(0, battery_row - row_height + 2),
                 Size::new(320, row_height as u32),
@@ -326,6 +267,7 @@ fn main() -> ! {
                 .unwrap();
         }
 
+        // Display button status
         // TODO: rewrite DRY
         let button1_style = if BUTTON1_STATE.load(Ordering::Relaxed) {
             PrimitiveStyleBuilder::new().fill_color(Rgb565::RED).build()
