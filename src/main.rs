@@ -1,17 +1,38 @@
 #![no_std]
 #![no_main]
 
+// Setup the allocator
+extern crate alloc;
+use embedded_alloc::LlffHeap as Heap;
+// Create a global allocator instance
+#[global_allocator]
+static HEAP: Heap = Heap::empty();
+// Reserve a static heap region (here: 32 KB)
+const HEAP_SIZE: usize = 32 * 1024;
+static mut HEAP_MEM: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
+
+// Debug formatting
 use defmt::*;
 use defmt_rtt as _;
-use embedded_graphics::prelude::WebColors;
 
-use core::fmt::Write;
-use heapless::String;
-//
+// Core functionalities
+use alloc::{rc::Rc, string::String};
+use core::{
+    cell::{RefCell, RefMut, UnsafeCell},
+    fmt::Write,
+    mem::MaybeUninit,
+    sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, Ordering},
+};
+use critical_section::Mutex;
 
-use embedded_hal::delay::DelayNs;
-use embedded_hal::digital::{OutputPin, StatefulOutputPin};
-use embedded_hal::spi::MODE_0;
+use embedded_hal::{
+    delay::DelayNs,
+    digital::{InputPin, OutputPin},
+    spi::MODE_0,
+};
+use embedded_sdmmc::{
+    DirEntry, Error, Mode, SdCard, SdCardError, TimeSource, Timestamp, VolumeIdx, VolumeManager,
+};
 use ili9341::{Ili9341, Orientation};
 use panic_probe as _;
 use rp235x_hal::{
@@ -24,13 +45,11 @@ use rp235x_hal::{
     {self as hal, entry},
 };
 
-// Interrupts
-use core::cell::RefCell;
-use critical_section::Mutex;
-
 // Peripherals
 use display_interface_spi::SPIInterface;
-use ds323x::{DateTimeAccess, Datelike, Ds323x, NaiveDate, Timelike};
+use ds323x::{
+    DateTimeAccess, Datelike, Ds323x, NaiveDateTime, Timelike, ic::DS3231, interface::I2cInterface,
+};
 use ina219::SyncIna219;
 use ina219::address::Address;
 
@@ -39,8 +58,9 @@ use embedded_graphics::{
     Drawable,
     mono_font::{MonoTextStyle, ascii},
     pixelcolor::{Rgb565, RgbColor},
+    prelude::*,
     prelude::{Point, Primitive, Size},
-    primitives::{Ellipse, PrimitiveStyleBuilder, Rectangle},
+    primitives::{Arc, Ellipse, PrimitiveStyle, PrimitiveStyleBuilder, Rectangle},
     text::{Text, renderer::CharacterStyle},
 };
 
@@ -57,29 +77,110 @@ const MIN_BUS_VOLTAGE: u16 = 3800;
 #[used]
 pub static IMAGE_DEF: hal::block::ImageDef = hal::block::ImageDef::secure_exe();
 
-// Pin types quickly become very long!
-// We'll create some type aliases using `type` to help with that
+// Pins setup
+type Button1Pin = Pin<gpio::bank0::Gpio12, gpio::FunctionSioInput, gpio::PullUp>;
+type Button2Pin = Pin<gpio::bank0::Gpio13, gpio::FunctionSioInput, gpio::PullUp>;
+type EncoderAPin = Pin<gpio::bank0::Gpio2, gpio::FunctionSioInput, gpio::PullUp>;
+type EncoderBPin = Pin<gpio::bank0::Gpio3, gpio::FunctionSioInput, gpio::PullUp>;
 
-/// This pin will be our output - it will drive an LED if you run this on a Pico
-type LedPin = Pin<gpio::bank0::Gpio4, gpio::FunctionSioOutput, gpio::PullDown>;
+static BUTTON1_PIN: Mutex<RefCell<Option<Button1Pin>>> = Mutex::new(RefCell::new(None));
+static BUTTON2_PIN: Mutex<RefCell<Option<Button2Pin>>> = Mutex::new(RefCell::new(None));
+static ENCODER_A_PIN: Mutex<RefCell<Option<EncoderAPin>>> = Mutex::new(RefCell::new(None));
+static ENCODER_B_PIN: Mutex<RefCell<Option<EncoderBPin>>> = Mutex::new(RefCell::new(None));
 
-/// This pin will be our interrupt source.
-/// It will trigger an interrupt if pulled to ground (via a switch or jumper wire)
-type ButtonPin = Pin<gpio::bank0::Gpio12, gpio::FunctionSioInput, gpio::PullUp>;
+// Global States, buttons
+static BUTTON1_STATE: AtomicBool = AtomicBool::new(false);
+static BUTTON2_STATE: AtomicBool = AtomicBool::new(false);
+// Encoder
+static ENCODER_COUNT: AtomicI32 = AtomicI32::new(0);
+static ENCODER_LAST_STATE: AtomicU8 = AtomicU8::new(0);
 
-/// Since we're always accessing these pins together we'll store them in a tuple.
-/// Giving this tuple a type alias means we won't need to use () when putting them
-/// inside an Option. That will be easier to read.
-type LedAndButton = (LedPin, ButtonPin);
+// Debounce
+static BUTTON1_LAST: AtomicU32 = AtomicU32::new(0);
+static BUTTON2_LAST: AtomicU32 = AtomicU32::new(0);
+static ENCODER_LAST: AtomicU32 = AtomicU32::new(0);
+static BUTTON_DEBOUNCE_DELAY_US: u32 = 200_000; // in microseconds
+static ENCODER_DEBOUNCE_DELAY_US: u32 = 15_000; // in microseconds
 
-/// This how we transfer our Led and Button pins into the Interrupt Handler.
-/// We'll have the option hold both using the LedAndButton type.
-/// This will make it a bit easier to unpack them later.
-static GLOBAL_STATE: Mutex<RefCell<Option<LedAndButton>>> = Mutex::new(RefCell::new(None));
+struct RtcTimeSource<I2C> {
+    // QUESTION: Do I have to pack it in a RefCell to be able to borrow it in the get_timestamp implementation?
+    // Is there a simpler way to do it. To my understanding the ownership isn't the issue, but the TimeSource trait
+    // constraint is the limitation.
+    rtc: RefCell<Ds323x<I2cInterface<I2C>, DS3231>>,
+}
 
+impl<I2C> RtcTimeSource<I2C>
+where
+    I2C: embedded_hal::i2c::I2c,
+{
+    pub fn new(i2c_bus: I2C) -> Self {
+        Self {
+            rtc: RefCell::new(Ds323x::new_ds3231(i2c_bus)),
+        }
+    }
+
+    fn with_rtc<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut RefMut<Ds323x<I2cInterface<I2C>, DS3231>>) -> R,
+    {
+        let mut rtc = self.rtc.borrow_mut();
+        f(&mut rtc)
+    }
+
+    fn get_datetime(
+        &self,
+    ) -> Result<NaiveDateTime, ds323x::Error<<I2C as embedded_hal::i2c::ErrorType>::Error>> {
+        self.with_rtc(|rtc| rtc.datetime())
+    }
+}
+
+// This Newtype wrapper is required impl TimeSource on an Rc instance. See below when instantiating rtc_timesource.
+pub struct SharedRtcTimeSource<I2C>(pub Rc<RtcTimeSource<I2C>>);
+
+impl<I2C> Clone for SharedRtcTimeSource<I2C> {
+    fn clone(&self) -> Self {
+        SharedRtcTimeSource(self.0.clone())
+    }
+}
+
+impl<I2C> TimeSource for SharedRtcTimeSource<I2C>
+where
+    I2C: embedded_hal::i2c::I2c,
+{
+    fn get_timestamp(&self) -> Timestamp {
+        if let Ok(dt) = self.0.with_rtc(|rtc| rtc.datetime()) {
+            Timestamp {
+                year_since_1970: (dt.year() as i32 - 1970) as u8,
+                zero_indexed_month: (dt.month() as u8) - 1,
+                zero_indexed_day: (dt.day() as u8) - 1,
+                hours: dt.hour() as u8,
+                minutes: dt.minute() as u8,
+                seconds: dt.second() as u8,
+            }
+        } else {
+            // Provide a sensible fallback in case of error.
+            Timestamp {
+                year_since_1970: 0,
+                zero_indexed_month: 0,
+                zero_indexed_day: 0,
+                hours: 0,
+                minutes: 0,
+                seconds: 0,
+            }
+        }
+    }
+}
+
+// Rust 2024 deny it by default. Allowance is required to initialize the allocator.
+#[allow(static_mut_refs)]
 #[entry]
 fn main() -> ! {
     info!("Program start");
+
+    // Initialize the allocator. Ensure this happen only once.
+    unsafe {
+        HEAP.init(HEAP_MEM.as_ptr() as usize, HEAP_SIZE);
+    }
 
     let mut pac = hal::pac::Peripherals::take().unwrap();
     let mut watchdog = hal::Watchdog::new(pac.WATCHDOG);
@@ -137,7 +238,8 @@ fn main() -> ! {
 
     let reset_pin = pins.gpio27.into_push_pull_output();
     let dc_pin = pins.gpio26.into_push_pull_output();
-    let cs_pin = pins.gpio17.into_push_pull_output();
+    let display_cs_pin = pins.gpio17.into_push_pull_output();
+    let sd_cs_pin = pins.gpio8.into_push_pull_output();
 
     let spi = Spi::<_, _, _, 8>::new(pac.SPI0, spi_pin_layout).init(
         &mut pac.RESETS,
@@ -145,48 +247,49 @@ fn main() -> ! {
         16_000_000u32.Hz(),
         MODE_0,
     );
+    let spi_bus = RefCell::new(spi);
     let mut timer = hal::Timer::new_timer0(pac.TIMER0, &mut pac.RESETS, &clocks);
 
-    let excl_spi_dev = embedded_hal_bus::spi::ExclusiveDevice::new(spi, cs_pin, timer).unwrap();
-    let iface = SPIInterface::new(excl_spi_dev, dc_pin);
+    let exclusive_display_spi_dev =
+        embedded_hal_bus::spi::RefCellDevice::new(&spi_bus, display_cs_pin, timer).unwrap();
+    let exclusive_sd_spi_dev =
+        embedded_hal_bus::spi::RefCellDevice::new(&spi_bus, sd_cs_pin, timer).unwrap();
 
-    // Mapping
-    // let mut encoder_a_pin = pins.gpio2.into_pull_up_input();
-    // let mut encoder_b_pin = pins.gpio3.into_pull_up_input();
-    // let mut encoder_led_pin = pins.gpio4.into_push_pull_output();
-    // let mut encoder_switch_pin = pins.gpio5.into_pull_up_input();
-    //
-    // let mut button1_pin = pins.gpio12.into_pull_up_input();
-    // let mut button2_pin = pins.gpio13.into_pull_up_input();
-
+    let display_iface = SPIInterface::new(exclusive_display_spi_dev, dc_pin);
 
     //
     // Interrupts
     //
 
-    // Configure GPIO 4 as an output to drive our LED.
-    // we can use reconfigure() instead of into_pull_up_input()
-    // since the variable we're pushing it into has that type
-    // let led = pins.gpio25.reconfigure();
-    // let encoder_led_pin = pins.gpio4.into_push_pull_output();
-    let encoder_led_pin = pins.gpio4.reconfigure();
+    // let button1_pin = pins.gpio12.reconfigure();
+    let button1_pin = pins.gpio12.into_pull_up_input();
+    let button2_pin = pins.gpio13.into_pull_up_input();
 
-    // Set up the GPIO pin that will be our input
-    // let in_pin = pins.gpio26.reconfigure();
-    // let button1_pin = pins.gpio12.into_pull_up_input();
-    let button1_pin = pins.gpio12.reconfigure();
+    let encoder_a_pin = pins.gpio2.into_pull_up_input();
+    let encoder_b_pin = pins.gpio3.into_pull_up_input();
+    // let mut encoder_led_pin = pins.gpio4.into_push_pull_output();
+    // let mut encoder_switch_pin = pins.gpio5.into_pull_up_input();
 
     // Trigger on the 'falling edge' of the input pin.
     // This will happen as the button is being pressed
     button1_pin.set_interrupt_enabled(gpio::Interrupt::EdgeLow, true);
+    button2_pin.set_interrupt_enabled(gpio::Interrupt::EdgeLow, true);
+    // For encoders, both edges are relevant
+    encoder_a_pin.set_interrupt_enabled(gpio::Interrupt::EdgeLow, true);
+    encoder_a_pin.set_interrupt_enabled(gpio::Interrupt::EdgeHigh, true);
+    encoder_b_pin.set_interrupt_enabled(gpio::Interrupt::EdgeLow, true);
+    encoder_b_pin.set_interrupt_enabled(gpio::Interrupt::EdgeHigh, true);
 
-    // Give away our pins by moving them into the `GLOBAL_PINS` variable.
-    // We won't need to access them in the main thread again
+    // Export to global mutexes
     critical_section::with(|cs| {
-        GLOBAL_STATE
-            .borrow(cs)
-            .replace(Some((encoder_led_pin, button1_pin)));
+        BUTTON1_PIN.borrow(cs).replace(Some(button1_pin));
+        BUTTON2_PIN.borrow(cs).replace(Some(button2_pin));
+        ENCODER_A_PIN.borrow(cs).replace(Some(encoder_a_pin));
+        ENCODER_B_PIN.borrow(cs).replace(Some(encoder_b_pin));
     });
+
+    // Initialize encoder state
+    ENCODER_LAST_STATE.store(0, Ordering::Relaxed);
 
     // Unmask the IRQ for I/O Bank 0 so that the RP2350's interrupt controller
     // (NVIC in Arm mode, or Xh3irq in RISC-V mode) will jump to the interrupt
@@ -205,7 +308,7 @@ fn main() -> ! {
     }
 
     // RTC
-    let mut rtc = Ds323x::new_ds3231(rtc_i2c);
+    let rtc_timesource = SharedRtcTimeSource(Rc::new(RtcTimeSource::new(rtc_i2c)));
     // Set time manually:
     // let begin = NaiveDate::from_ymd_opt(2025, 8, 21)
     //     .unwrap()
@@ -231,7 +334,7 @@ fn main() -> ! {
     let mut backlight_pin = pins.gpio15.into_push_pull_output();
 
     let mut display = Ili9341::new(
-        iface,
+        display_iface,
         reset_pin,
         &mut timer,
         Orientation::LandscapeFlipped,
@@ -245,10 +348,6 @@ fn main() -> ! {
 
     let battery_bar_style = PrimitiveStyleBuilder::new()
         .fill_color(Rgb565::CSS_AQUA)
-        .build();
-
-    let button_dot_style = PrimitiveStyleBuilder::new()
-        .fill_color(Rgb565::WHITE)
         .build();
 
     let debug_style = PrimitiveStyleBuilder::new()
@@ -278,7 +377,22 @@ fn main() -> ! {
     // Turn on the display
     backlight_pin.set_high().unwrap();
 
-    let mut previous_datetime = rtc.datetime().unwrap().and_utc();
+    // SD-Card
+    let sdcard = SdCard::new(exclusive_sd_spi_dev, timer);
+    info!("Card size is {} bytes", sdcard.num_bytes().unwrap());
+    let volume_mgr = VolumeManager::new(sdcard, rtc_timesource.clone());
+    let shared_rtc = rtc_timesource.0;
+
+    let raw_volume0 = volume_mgr.open_raw_volume(VolumeIdx(0)).unwrap();
+
+    let root_dir = volume_mgr.open_root_dir(raw_volume0).unwrap();
+    let print = |item: &DirEntry| {
+        let filename = core::str::from_utf8(item.name.base_name()).unwrap();
+        info!("{:?} {:?} Mb", filename, item.size as f32 / 1024.0 / 1024.0)
+    };
+    volume_mgr.iterate_dir(root_dir, print).unwrap();
+
+    let mut previous_datetime = shared_rtc.get_datetime().unwrap().and_utc();
 
     let row_height = 20; // pixels
     let datetime_row = 2 * row_height;
@@ -292,10 +406,9 @@ fn main() -> ! {
         // hal::arch::wfi();
 
         // Get and display the time
-        let datetime = rtc.datetime().unwrap().and_utc();
-        if previous_datetime.timestamp() % 100 != datetime.timestamp() % 100 {
-            let mut line: String<20> = String::new();
-            let dt = rtc.datetime().unwrap();
+        let dt = shared_rtc.get_datetime().unwrap();
+        if previous_datetime.timestamp() % 100 != dt.and_utc().timestamp() % 100 {
+            let mut line: String = String::new();
             core::write!(
                 &mut line,
                 "{}/{:02}/{:02} {:02}:{:02}:{:02}",
@@ -308,30 +421,37 @@ fn main() -> ! {
             )
             .unwrap();
 
-            Rectangle::new(Point::new(0, datetime_row - row_height + 2), Size::new(320, row_height as u32))
-                .into_styled(bg_style)
-                .draw(&mut display)
-                .unwrap();
+            Rectangle::new(
+                Point::new(0, datetime_row - row_height + 2),
+                Size::new(320, row_height as u32),
+            )
+            .into_styled(bg_style)
+            .draw(&mut display)
+            .unwrap();
 
             text_style.set_text_color(Some(Rgb565::WHITE));
             Text::new(line.as_str(), Point::new(5, datetime_row), text_style)
                 .draw(&mut display)
                 .unwrap();
 
-            previous_datetime = datetime;
+            previous_datetime = dt.and_utc();
         }
 
         // Get and display the battery status
         if let Some(ref mut ina_dev) = ina {
-            Rectangle::new(Point::new(0, battery_row - row_height + 2), Size::new(320, row_height as u32))
-                .into_styled(bg_style)
-                .draw(&mut display)
-                .unwrap();
+            Rectangle::new(
+                Point::new(0, battery_row - row_height + 2),
+                Size::new(320, row_height as u32),
+            )
+            .into_styled(bg_style)
+            .draw(&mut display)
+            .unwrap();
 
             let shunt = ina_dev.shunt_voltage().unwrap();
             let bus = ina_dev.bus_voltage().unwrap();
             let bar_resolution = (MAX_BUS_VOLTAGE - MIN_BUS_VOLTAGE) as f32;
-            let bar_percentage = 100.0 / bar_resolution * (bus.voltage_mv() - MIN_BUS_VOLTAGE) as f32;
+            let bar_percentage =
+                100.0 / bar_resolution * (bus.voltage_mv() - MIN_BUS_VOLTAGE) as f32;
             // This averages a bit the percentage and prevents flickering
             let bar_width = bar_percentage * 3.2;
 
@@ -341,21 +461,25 @@ fn main() -> ! {
                 text_style.set_text_color(Some(Rgb565::GREEN));
             }
 
-            let mut percentage_line: String<5> = String::new();
+            let mut percentage_line: String = String::new();
             core::write!(&mut percentage_line, "{}%", bar_percentage).unwrap();
             // info!("{}", bus_line.as_str());
-            Text::new(percentage_line.as_str(), Point::new(5, battery_row), text_style)
-                .draw(&mut display)
-                .unwrap();
+            Text::new(
+                percentage_line.as_str(),
+                Point::new(5, battery_row),
+                text_style,
+            )
+            .draw(&mut display)
+            .unwrap();
 
-            let mut bus_line: String<20> = String::new();
+            let mut bus_line: String = String::new();
             core::write!(&mut bus_line, "Bus: {} mV", bus.voltage_mv()).unwrap();
             // info!("{}", bus_line.as_str());
             Text::new(bus_line.as_str(), Point::new(50, battery_row), text_style)
                 .draw(&mut display)
                 .unwrap();
 
-            let mut shunt_line: String<20> = String::new();
+            let mut shunt_line: String = String::new();
             core::write!(&mut shunt_line, "Shunt: {} mV", shunt.shunt_voltage_mv()).unwrap();
             // info!("{}", shunt_line.as_str());
             Text::new(
@@ -366,14 +490,20 @@ fn main() -> ! {
             .draw(&mut display)
             .unwrap();
 
-            Rectangle::new(Point::new(0, battery_bar_row - (row_height / 2) + 2), Size::new(320 as u32, 2))
-                .into_styled(bg_style)
-                .draw(&mut display)
-                .unwrap();
-            Rectangle::new(Point::new(0, battery_bar_row - (row_height / 2) + 2), Size::new(bar_width as u32, 2))
-                .into_styled(battery_bar_style)
-                .draw(&mut display)
-                .unwrap();
+            Rectangle::new(
+                Point::new(0, battery_bar_row - (row_height / 2) + 2),
+                Size::new(320 as u32, 2),
+            )
+            .into_styled(bg_style)
+            .draw(&mut display)
+            .unwrap();
+            Rectangle::new(
+                Point::new(0, battery_bar_row - (row_height / 2) + 2),
+                Size::new(bar_width as u32, 2),
+            )
+            .into_styled(battery_bar_style)
+            .draw(&mut display)
+            .unwrap();
         } else {
             text_style.set_text_color(Some(Rgb565::RED));
             Text::new("No battery", Point::new(5, battery_row), text_style)
@@ -381,32 +511,60 @@ fn main() -> ! {
                 .unwrap();
         }
 
-        // info!("loop");
+        // TODO: rewrite DRY
+        let button1_style = if BUTTON1_STATE.load(Ordering::Relaxed) {
+            PrimitiveStyleBuilder::new().fill_color(Rgb565::RED).build()
+        } else {
+            PrimitiveStyleBuilder::new()
+                .fill_color(Rgb565::WHITE)
+                .build()
+        };
+
+        Ellipse::new(
+            Point::new(5, buttons_row),
+            Size::new(button_dot_size, button_dot_size),
+        )
+        .into_styled(button1_style)
+        .draw(&mut display)
+        .unwrap();
+
+        let button2_style = if BUTTON2_STATE.load(Ordering::Relaxed) {
+            PrimitiveStyleBuilder::new().fill_color(Rgb565::RED).build()
+        } else {
+            PrimitiveStyleBuilder::new()
+                .fill_color(Rgb565::WHITE)
+                .build()
+        };
+
+        Ellipse::new(
+            Point::new(50, buttons_row),
+            Size::new(button_dot_size, button_dot_size),
+        )
+        .into_styled(button2_style)
+        .draw(&mut display)
+        .unwrap();
+
+        let encoder_value = ENCODER_COUNT.load(Ordering::Relaxed) as f32;
+
+        Arc::new(
+            Point::new(100, buttons_row),
+            20,
+            -45_f32.deg(),
+            (-45.0 + encoder_value).deg(),
+        )
+        .into_styled(PrimitiveStyle::with_stroke(Rgb565::YELLOW, 2))
+        .draw(&mut display)
+        .unwrap();
+
         timer.delay_ms(100);
-
-        Ellipse::new(Point::new(buttons_row, 5), Size::new(button_dot_size, button_dot_size))
-            .into_styled(button_dot_style)
-            .draw(&mut display)
-            .unwrap();
-
-        Ellipse::new(Point::new(buttons_row, 50), Size::new(button_dot_size, button_dot_size))
-            .into_styled(button_dot_style)
-            .draw(&mut display)
-            .unwrap();
-
-        // x_pos += dot_size as i32;
-        // if x_pos >= 320 {
-        //     x_pos = 0;
-        //     y_pos += dot_size as i32;
-        // }
-        // if y_pos >= 240 {
-        //     y_pos = 120;
-        //     Rectangle::new(Point::new(0, 120), Size::new(320, 120))
-        //         .into_styled(bg_style)
-        //         .draw(&mut display)
-        //         .unwrap();
-        // }
     }
+}
+
+#[inline(always)]
+fn now_us() -> u32 {
+    // Safe because we're only *reading* from a monotonic counter
+    let timer = unsafe { &*hal::pac::TIMER0::ptr() };
+    timer.timerawl().read().bits() // lower 32 bits of the free-running timer
 }
 
 /// This is the interrupt handler that fires when GPIO Bank 0 detects an event
@@ -422,24 +580,87 @@ fn IO_IRQ_BANK0() {
     // executed on the other core. This also protects us if the main thread
     // decides to execute this function (which it shouldn't, but we can't stop
     // them if they wanted to).
+
     critical_section::with(|cs| {
-        // Grab a mutable reference to the global state, using the CS token as
-        // proof we have turned off interrupts. Performs a run-time borrow check
-        // of the RefCell to ensure no-one else is currently borrowing it (and
-        // they shouldn't, because we're in a critical section right now).
-        let mut maybe_state = GLOBAL_STATE.borrow_ref_mut(cs);
-        // Need to check if our Option<LedAndButtonPins> contains our pins
-        if let Some((led, button)) = maybe_state.as_mut() {
-            // Check if the interrupt source is from the pushbutton going from high-to-low.
-            // Note: this will always be true in this example, as that is the only enabled GPIO interrupt source
-            if button.interrupt_status(gpio::Interrupt::EdgeLow) {
-                // toggle can't fail, but the embedded-hal traits always allow for it
-                // we can discard the return value by assigning it to an unnamed variable
-                let _ = led.toggle();
-                // Our interrupt doesn't clear itself.
-                // Do that now so we don't immediately jump back to this interrupt handler.
-                button.clear_interrupt(gpio::Interrupt::EdgeLow);
+        let now_us = now_us();
+
+        // FIXME: not DRY
+        // BUTTON1
+        if let Some(ref mut btn1) = BUTTON1_PIN.borrow(cs).borrow_mut().as_mut() {
+            if btn1.interrupt_status(hal::gpio::Interrupt::EdgeLow) {
+                let last = BUTTON1_LAST.load(Ordering::Relaxed);
+                if now_us.wrapping_sub(last) > BUTTON_DEBOUNCE_DELAY_US {
+                    let cur = BUTTON1_STATE.load(Ordering::Relaxed);
+                    BUTTON1_STATE.store(!cur, Ordering::Relaxed);
+                    BUTTON1_LAST.store(now_us, Ordering::Relaxed);
+                }
+                btn1.clear_interrupt(hal::gpio::Interrupt::EdgeLow);
             }
+        }
+
+        // BUTTON2
+        if let Some(ref mut btn2) = BUTTON2_PIN.borrow(cs).borrow_mut().as_mut() {
+            if btn2.interrupt_status(hal::gpio::Interrupt::EdgeLow) {
+                let last = BUTTON2_LAST.load(Ordering::Relaxed);
+                if now_us.wrapping_sub(last) > BUTTON_DEBOUNCE_DELAY_US {
+                    let cur = BUTTON2_STATE.load(Ordering::Relaxed);
+                    BUTTON2_STATE.store(!cur, Ordering::Relaxed);
+                    BUTTON2_LAST.store(now_us, Ordering::Relaxed);
+                }
+                btn2.clear_interrupt(hal::gpio::Interrupt::EdgeLow);
+            }
+        }
+
+        // ENCODER
+        // FIXME: Not Dry
+        let mut new_state = 0u8;
+
+        // FIXME: There is much better ways to debounce the encoder, either in software or with a schmitt-trigger.
+        // Using an IC will increase the BoM, but should be more reliable, and spares interrupts and CPU cycles.
+        let last = ENCODER_LAST.load(Ordering::Relaxed);
+        if now_us.wrapping_sub(last) > ENCODER_DEBOUNCE_DELAY_US {
+            if let Some(ref mut enc_a) = ENCODER_A_PIN.borrow(cs).borrow_mut().as_mut() {
+                if enc_a.interrupt_status(hal::gpio::Interrupt::EdgeLow)
+                    || enc_a.interrupt_status(hal::gpio::Interrupt::EdgeHigh)
+                {
+                    enc_a.clear_interrupt(hal::gpio::Interrupt::EdgeLow);
+                    enc_a.clear_interrupt(hal::gpio::Interrupt::EdgeHigh);
+                }
+                if enc_a.is_high().unwrap_or(false) {
+                    new_state |= 0b10;
+                }
+            }
+
+            if let Some(ref mut enc_b) = ENCODER_B_PIN.borrow(cs).borrow_mut().as_mut() {
+                if enc_b.interrupt_status(hal::gpio::Interrupt::EdgeLow)
+                    || enc_b.interrupt_status(hal::gpio::Interrupt::EdgeHigh)
+                {
+                    enc_b.clear_interrupt(hal::gpio::Interrupt::EdgeLow);
+                    enc_b.clear_interrupt(hal::gpio::Interrupt::EdgeHigh);
+                }
+                if enc_b.is_high().unwrap_or(false) {
+                    new_state |= 0b01;
+                }
+            }
+
+            let last = ENCODER_LAST_STATE.load(Ordering::Relaxed);
+
+            // Quadrature decoding table
+            // (last_state << 2 | new_state) → delta
+            const LOOKUP: [i32; 16] = [
+                0, -1, 1, 0, // 00
+                1, 0, 0, -1, // 01
+                -1, 0, 0, 1, // 10
+                0, 1, -1, 0, // 11
+            ];
+
+            let idx = (last << 2 | new_state) as usize;
+            let delta = LOOKUP[idx];
+            if delta != 0 {
+                ENCODER_COUNT.fetch_add(delta, Ordering::Relaxed);
+                ENCODER_LAST_STATE.store(new_state, Ordering::Relaxed);
+            }
+            ENCODER_LAST.store(now_us, Ordering::Relaxed);
         }
     });
 }
