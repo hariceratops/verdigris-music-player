@@ -46,3 +46,4 @@ Use `cargo run` or `cargo run --release` to upload the program using the probe.
 - https://github.com/ariel-os/ariel-os
 - https://www.raspberrypi.com/news/rust-on-rp2350/
 - https://wiki.thejpster.org.uk/
+- I2S example with PIO and Embassy https://github.com/embassy-rs/embassy/blob/main/examples/rp/src/bin/pio_i2s.rs
