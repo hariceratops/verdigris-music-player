@@ -32,7 +32,7 @@ static BUTTON1_LAST: AtomicU32 = AtomicU32::new(0);
 static BUTTON2_LAST: AtomicU32 = AtomicU32::new(0);
 static ENCODER_LAST: AtomicU32 = AtomicU32::new(0);
 static BUTTON_DEBOUNCE_DELAY_US: u32 = 200_000; // in microseconds
-static ENCODER_DEBOUNCE_DELAY_US: u32 = 15_000; // in microseconds
+static ENCODER_DEBOUNCE_DELAY_US: u32 = 1_000; // in microseconds
 
 // TODO: Return a meaningful result
 pub fn init(

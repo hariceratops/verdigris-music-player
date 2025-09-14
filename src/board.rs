@@ -42,8 +42,8 @@ pub enum Error {
 
 pub type Button1Pin = Pin<Gpio12, FunctionSioInput, PullUp>;
 pub type Button2Pin = Pin<Gpio13, FunctionSioInput, PullUp>;
-pub type EncoderAPin = Pin<Gpio2, FunctionSioInput, PullUp>;
-pub type EncoderBPin = Pin<Gpio3, FunctionSioInput, PullUp>;
+pub type EncoderAPin = Pin<Gpio2, FunctionSioInput, PullDown>;
+pub type EncoderBPin = Pin<Gpio3, FunctionSioInput, PullDown>;
 
 pub type SpiDcPin = Pin<Gpio26, FunctionSioOutput, PullDown>;
 pub type SpiResetPin = Pin<Gpio27, FunctionSioOutput, PullDown>;
@@ -172,8 +172,8 @@ impl Board {
         let button1_pin = pins.gpio12.into_pull_up_input();
         let button2_pin = pins.gpio13.into_pull_up_input();
 
-        let encoder_a_pin = pins.gpio2.into_pull_up_input();
-        let encoder_b_pin = pins.gpio3.into_pull_up_input();
+        let encoder_a_pin = pins.gpio2.into_pull_down_input();
+        let encoder_b_pin = pins.gpio3.into_pull_down_input();
         // let mut encoder_led_pin = pins.gpio4.into_push_pull_output();
         // let mut encoder_switch_pin = pins.gpio5.into_pull_up_input();
 

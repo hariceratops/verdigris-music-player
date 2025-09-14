@@ -16,9 +16,9 @@ use defmt::*;
 use defmt_rtt as _;
 
 // Core functionalities
-use alloc::string::String;
+use alloc::{string::String};
 use core::{fmt::Write, sync::atomic::Ordering};
-use embedded_hal_bus::{spi::AtomicDevice};
+use embedded_hal_bus::spi::AtomicDevice;
 
 use embedded_hal::digital::OutputPin;
 use embedded_sdmmc::{DirEntry, SdCard, VolumeIdx, VolumeManager};
@@ -28,24 +28,25 @@ use rp235x_hal::{
     {self as hal, entry},
 };
 
+use libm;
+
 // UI
 // TODO: Move the Display logic in its own file
 use embedded_graphics::{
     Drawable,
     mono_font::{MonoTextStyle, ascii},
     pixelcolor::{Rgb565, RgbColor},
-    prelude::*,
-    prelude::{Point, Primitive, Size},
-    primitives::{Arc, Ellipse, PrimitiveStyle, PrimitiveStyleBuilder, Rectangle},
+    prelude::{Point, Primitive, Size, *},
+    primitives::{Circle, Ellipse, Line, PrimitiveStyle, PrimitiveStyleBuilder, Rectangle},
     text::{Text, renderer::CharacterStyle},
 };
 
-mod rtc;
-mod interrupts;
 mod board;
+mod interrupts;
+mod rtc;
 
-use interrupts::{BUTTON1_STATE, BUTTON2_STATE, ENCODER_COUNT};
 use board::Board;
+use interrupts::{BUTTON1_STATE, BUTTON2_STATE, ENCODER_COUNT};
 
 // Battery
 const MAX_BUS_VOLTAGE: u16 = 4200;
@@ -301,15 +302,47 @@ fn main() -> ! {
         .draw(&mut display)
         .unwrap();
 
-        let encoder_value = ENCODER_COUNT.load(Ordering::Relaxed) as f32;
+        // Encoder value
+        Rectangle::new(Point::new(160, buttons_row - 19), Size::new(160 as u32, 20))
+            .into_styled(bg_style)
+            .draw(&mut display)
+            .unwrap();
 
-        Arc::new(
-            Point::new(100, buttons_row),
-            20,
-            -45_f32.deg(),
-            (-45.0 + encoder_value).deg(),
+        let encoder_value = ENCODER_COUNT.load(Ordering::Relaxed) as f32;
+        let mut encoder_text: String = String::new();
+        core::write!(&mut encoder_text, "Encoder: {}", encoder_value).unwrap();
+        Text::new(
+            encoder_text.as_str(),
+            Point::new(160, buttons_row),
+            text_style,
         )
-        .into_styled(PrimitiveStyle::with_stroke(Rgb565::YELLOW, 2))
+        .draw(&mut display)
+        .unwrap();
+
+        let bg_style_pot = PrimitiveStyleBuilder::new()
+            .fill_color(Rgb565::WHITE)
+            .build();
+
+        Circle::new(Point::new(100, buttons_row), 40)
+            .into_styled(bg_style_pot)
+            .draw(&mut display)
+            .unwrap();
+
+        // potentiometer center
+        let pot = (120, buttons_row + 20);
+        let pot_pos = libm::sincosf(-encoder_value as f32 / 10.0);
+        let hand_length: f32 = 20.0; // pixels
+        let right_hand = (
+            pot.0 + (pot_pos.0 * hand_length) as i32,
+            pot.1 + (pot_pos.1 * hand_length) as i32,
+        );
+        info!("{:?} {:?}", pot_pos, right_hand);
+
+        Line::new(
+            Point::new(pot.0, pot.1),
+            Point::new(right_hand.0, right_hand.1),
+        )
+        .into_styled(PrimitiveStyle::with_stroke(Rgb565::RED, 3))
         .draw(&mut display)
         .unwrap();
     }

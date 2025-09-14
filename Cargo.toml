@@ -41,6 +41,7 @@ sha2-const-stable = "0.1"
 usb-device = "0.3.2"
 vcell = "0.1"
 void = {version = "1.0.2", default-features = false}
+libm = "0.2.15"
 
 # MCU
 rp-hal-common = {version = "0.1.0"}
