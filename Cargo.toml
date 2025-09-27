@@ -21,7 +21,6 @@ license = "MIT OR Apache-2.0"
 bitfield = "0.14.0"
 critical-section = "1.2.0"
 embedded-dma = "0.2.0"
-embedded-alloc = "0.6.0"
 embedded-hal = { version = "1.0.0" }
 embedded-hal-bus = { version = "0.3.0", features = ["portable-atomic"] }
 embedded-hal-async = "1.0.0"
@@ -42,6 +41,20 @@ usb-device = "0.3.2"
 vcell = "0.1"
 void = {version = "1.0.2", default-features = false}
 libm = "0.2.15"
+static_cell = "2.1"
+
+# Embassy
+embassy-embedded-hal = { version = "0.5.0", features = ["defmt"] }
+embassy-sync = { version = "0.7.2", features = ["defmt"] }
+embassy-executor = { version = "0.9.0", features = ["arch-cortex-m", "executor-thread", "executor-interrupt", "defmt"] }
+embassy-time = { version = "0.5.0", features = ["defmt", "defmt-timestamp-uptime"] }
+embassy-rp = { version = "0.8.0", features = ["defmt", "unstable-pac", "time-driver", "critical-section-impl", "rp235xa", "binary-info"] }
+embassy-usb = { version = "0.5.1", features = ["defmt"] }
+embassy-net = { version = "0.7.1", features = ["defmt", "icmp", "tcp", "udp", "raw", "dhcpv4", "medium-ethernet", "dns"] }
+embassy-futures = { version = "0.1.2" }
+# embassy-usb-logger = { version = "0.5.1", path = "../../embassy-usb-logger" }
+cyw43 = { version = "0.5.0", features = ["defmt", "firmware-logs"] }
+cyw43-pio = { version = "0.8.0", features = ["defmt"] }
 
 # MCU
 rp-hal-common = {version = "0.1.0"}
@@ -60,12 +73,13 @@ defmt-rtt = "1"
 panic-probe = { version = "1", features = ["print-defmt"] }
 
 # Peripherals
-ili9341 = "0.6.0"
+# ili9341 = "0.6.0"
 display-interface-spi = "0.5.0"
 embedded-graphics = "0.8"
 ds323x = "0.6.0"
-# heapless = "0.8"
+heapless = "0.8"
 ina219 = "0.2"
+mipidsi = "0.9.0"
 
 # cargo build/run
 [profile.dev]
