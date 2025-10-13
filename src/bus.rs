@@ -1,6 +1,4 @@
 use core::cell::RefCell;
-
-use defmt::info;
 use ds323x::Ds323x;
 use embassy_embedded_hal::shared_bus::{
     asynch::i2c::I2cDevice as AsyncI2cDevice,
@@ -18,16 +16,15 @@ use embassy_sync::{
     mutex::Mutex as AsyncMutex,
 };
 use embassy_time::{Delay, Timer};
+use ina219::{AsyncIna219, address::Address, calibration::UnCalibrated};
 use mipidsi::{
     Builder,
     interface::SpiInterface,
     models::ILI9341Rgb565,
-    options::{Orientation, Rotation},
+    options::{ColorOrder, Orientation, Rotation},
 };
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
-
-use ina219::{AsyncIna219, address::Address, calibration::UnCalibrated};
 
 use crate::rtc::RtcTimeSource;
 
@@ -48,8 +45,10 @@ pub(crate) type Display = mipidsi::Display<
     Output<'static>,
 >;
 
-static SPI_0_BUS: StaticCell<Spi0Bus> = StaticCell::new();
-static DISPLAY_BUFFER: StaticCell<[u8; 76800]> = StaticCell::new();
+static I2C0_BUS: StaticCell<I2c0Bus> = StaticCell::new();
+static I2C1_BUS: StaticCell<I2c1Bus> = StaticCell::new();
+static SPI0_BUS: StaticCell<Spi0Bus> = StaticCell::new();
+static DISPLAY_IFACE_BUFFER: StaticCell<[u8; 480]> = StaticCell::new();
 
 bind_interrupts!(struct I2C1Irqs {
     I2C1_IRQ => I2CInterruptHandler<I2C1>;
@@ -59,7 +58,6 @@ const DISPLAY_FREQ: u32 = 64_000_000;
 
 #[derive(Debug)]
 pub enum Error {
-    // InitializationError,
     DisplayInitError,
     // RtcInitError,
     BatteryInitError,
@@ -71,7 +69,6 @@ pub fn init_rtc(
     sda: Peri<'static, PIN_20>,
 ) -> RtcTimeSource<'static> {
     let i2c0_bus = I2c::new_blocking(bus, scl, sda, i2c::Config::default());
-    static I2C0_BUS: StaticCell<I2c0Bus> = StaticCell::new();
     let shared_i2c0_bus = I2C0_BUS.init(Mutex::new(RefCell::new(i2c0_bus)));
     let i2c_dev = BlockingI2cDevice::new(shared_i2c0_bus);
     let rtc_dev = Ds323x::new_ds3231(i2c_dev);
@@ -91,7 +88,6 @@ pub async fn init_battery(
 ) -> Result<&'static SharedBattery, Error> {
     let i2c1_bus = I2c::new_async(bus, scl, sda, I2C1Irqs, i2c::Config::default());
     // This doesn't really need to be static (to be shared), as there is only one device on the but today.
-    static I2C1_BUS: StaticCell<I2c1Bus> = StaticCell::new();
     let shared_i2c1_bus = I2C1_BUS.init(AsyncMutex::new(i2c1_bus));
     let i2c_dev = AsyncI2cDevice::new(shared_i2c1_bus);
     let ina219 = AsyncIna219::new(i2c_dev, Address::from_byte(0x43).unwrap()).await;
@@ -110,12 +106,12 @@ pub async fn init_battery(
 #[embassy_executor::task]
 pub async fn battery_job(ina: &'static SharedBattery) {
     loop {
-        let mut guard = ina.lock().await;
-        let shunt = guard.shunt_voltage().await.unwrap();
-        let bus = guard.bus_voltage().await.unwrap();
-        info!("shunt: {:?}, bus: {:?}", shunt.shunt_voltage_mv(), bus.voltage_mv());
-        drop(guard);
-
+        {
+            let mut guard = ina.lock().await;
+            let shunt = guard.shunt_voltage().await.unwrap();
+            let bus = guard.bus_voltage().await.unwrap();
+            crate::gui::charge(shunt.shunt_voltage_mv(), bus.voltage_mv()).await;
+        }
         Timer::after_secs(1).await
     }
 }
@@ -129,7 +125,7 @@ pub fn init_shared_spi(
     let spi_cfg = spi::Config::default();
     let spi = Spi::new_blocking(bus, clk, mosi, miso, spi_cfg);
     let spi_bus: Mutex<NoopRawMutex, _> = Mutex::new(RefCell::new(spi));
-    SPI_0_BUS.init(spi_bus)
+    SPI0_BUS.init(spi_bus)
 }
 
 pub fn init_display(
@@ -148,12 +144,13 @@ pub fn init_display(
 
     let dc = Output::new(dc_pin, Level::Low);
     let rst = Output::new(reset_pin, Level::Low);
-    let buffer_ref = DISPLAY_BUFFER.init([0_u8; 76800]); // 240 * 320
+    let buffer_ref = DISPLAY_IFACE_BUFFER.init([0_u8; 480]); // 240 * 320 = 76800
     let display_interface = SpiInterface::new(display_spi, dc, buffer_ref);
 
     let display = Builder::new(ILI9341Rgb565, display_interface)
         .display_size(240, 320)
         .reset_pin(rst)
+        .color_order(ColorOrder::Bgr)
         .orientation(Orientation::new().rotate(Rotation::Deg90).flip_horizontal())
         .init(&mut Delay);
 

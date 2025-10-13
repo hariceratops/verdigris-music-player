@@ -76,6 +76,7 @@ panic-probe = { version = "1", features = ["print-defmt"] }
 # ili9341 = "0.6.0"
 display-interface-spi = "0.5.0"
 embedded-graphics = "0.8"
+embedded-graphics-framebuf = "0.5.0"
 ds323x = "0.6.0"
 heapless = "0.8"
 ina219 = "0.2"
